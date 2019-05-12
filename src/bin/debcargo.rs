@@ -18,13 +18,14 @@ use ansi_term::Colour::Red;
 use clap::{App, AppSettings, ArgMatches, SubCommand};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use debcargo::errors::*;
+use debcargo::config::{parse_config, Config};
 use debcargo::crates::{update_crates_io, CrateInfo};
 use debcargo::debian::{self, BaseInfo};
-use debcargo::config::{parse_config, Config};
+use debcargo::errors::*;
 use debcargo::util;
 
 fn lookup_fixmes(srcdir: &Path) -> Result<Vec<PathBuf>> {
@@ -54,36 +55,49 @@ fn rel_p<'a>(path: &'a Path, base: &'a Path) -> &'a str {
     path.strip_prefix(base).unwrap_or(path).to_str().unwrap()
 }
 
-fn do_package(matches: &ArgMatches) -> Result<()> {
+fn new_crate_info(matches: &ArgMatches, update: bool) -> Result<CrateInfo> {
     let crate_name = matches.value_of("crate").unwrap();
     let version = matches.value_of("version");
+    let path = matches.value_of("path");
+    if let Some(path) = path {
+        let path = PathBuf::from_str(path)?.canonicalize()?;
+        CrateInfo::new_from_path(&path, version, update)
+    } else {
+        CrateInfo::new_from_crates_io(crate_name, version, update)
+    }
+}
+
+fn do_package(matches: &ArgMatches) -> Result<()> {
+    let crate_name = matches.value_of("crate").unwrap();
     let directory = matches.value_of("directory");
     let (config_path, config) = match matches.value_of("config") {
         Some(p) => {
             let path = Path::new(p);
-            let config = parse_config(path)
-                .context("failed to parse debcargo.toml")?;
+            let config = parse_config(path).context("failed to parse debcargo.toml")?;
             (Some(path), config)
-        },
+        }
         None => (None, Config::default()),
     };
     let changelog_ready = matches.is_present("changelog-ready");
     let overlay_write_back = !matches.is_present("no-overlay-write-back");
     let copyright_guess_harder = matches.is_present("copyright-guess-harder");
 
-    let mut crate_info = CrateInfo::new(crate_name, version)?;
-    let pkgbase = BaseInfo::new(crate_name, &crate_info, crate_version!(), config.semver_suffix);
+    let mut crate_info = new_crate_info(matches, true)?;
+    let pkgbase = BaseInfo::new(
+        crate_name,
+        &crate_info,
+        crate_version!(),
+        config.semver_suffix,
+    );
 
     let pkg_srcdir = Path::new(directory.unwrap_or(pkgbase.package_source_dir()));
-    let orig_tar_gz = pkg_srcdir.parent().unwrap().join(pkgbase.orig_tarball_path());
+    let orig_tar_gz = pkg_srcdir
+        .parent()
+        .unwrap()
+        .join(pkgbase.orig_tarball_path());
     crate_info.set_includes_excludes(config.orig_tar_excludes(), config.orig_tar_whitelist());
     let source_modified = crate_info.extract_crate(pkg_srcdir)?;
-    debian::prepare_orig_tarball(
-        &crate_info,
-        &orig_tar_gz,
-        source_modified,
-        pkg_srcdir,
-    )?;
+    debian::prepare_orig_tarball(&crate_info, &orig_tar_gz, source_modified, pkg_srcdir)?;
     debian::prepare_debian_folder(
         &pkgbase,
         &mut crate_info,
@@ -117,7 +131,9 @@ fn do_package(matches: &ArgMatches) -> Result<()> {
             match config_path {
                 None => debcargo_warn!("\t •  Write a config file and use it with --config"),
                 Some(c) => {
-                    debcargo_warn!(format!("\t •  Add or edit overrides in your config file:"));
+                    debcargo_warn!(format!(
+                        "\t •  Add or edit overrides in your config file:"
+                    ));
                     debcargo_warn!(format!("\t    {}", rel_p(&c, &curdir)));
                 }
             };
@@ -138,7 +154,7 @@ fn do_deb_src_name(matches: &ArgMatches) -> Result<()> {
     let crate_name = matches.value_of("crate").unwrap();
     let version = matches.value_of("version");
 
-    let crate_info = CrateInfo::new_with_update(crate_name, version, false)?;
+    let crate_info = new_crate_info(matches, false)?;
     let pkgbase = BaseInfo::new(crate_name, &crate_info, crate_version!(), version.is_some());
 
     println!("{}", pkgbase.package_name());
@@ -147,10 +163,9 @@ fn do_deb_src_name(matches: &ArgMatches) -> Result<()> {
 
 fn do_extract(matches: &ArgMatches) -> Result<()> {
     let crate_name = matches.value_of("crate").unwrap();
-    let version = matches.value_of("version");
     let directory = matches.value_of("directory");
 
-    let crate_info = CrateInfo::new(crate_name, version)?;
+    let crate_info = new_crate_info(matches, true)?;
     let pkgbase = BaseInfo::new(crate_name, &crate_info, crate_version!(), false);
     let pkg_srcdir = Path::new(directory.unwrap_or(pkgbase.package_source_dir()));
 
@@ -170,10 +185,11 @@ fn real_main() -> Result<()> {
         .global_setting(AppSettings::UnifiedHelpMessage)
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .subcommands(vec![SubCommand::with_name("package")
-                              .about("Package a crate from crates.io")
+                              .about("Package a crate from crates.io or path")
                               .arg_from_usage("<crate> 'Name of the crate to package'")
                               .arg_from_usage("[version] 'Version of the crate to package; may \
                                                include dependency operators'")
+                              .arg_from_usage("--path [path] 'If local package, path to the crate to package'")
                               .arg_from_usage("--directory [directory] 'Output directory.'")
                               .arg_from_usage("--changelog-ready 'Assume the changelog is already bumped, and leave it alone.'")
                               .arg_from_usage("--copyright-guess-harder 'Guess extra values for d/copyright. Might be slow.'")
@@ -183,9 +199,10 @@ fn real_main() -> Result<()> {
                      ])
         .subcommands(vec![SubCommand::with_name("deb-src-name")
                               .about("Prints the Debian package name for a crate")
-                              .arg_from_usage("<crate> 'Name of the crate to package'")
+                              .arg_from_usage("<crate> 'Name of the crate on to package'")
                               .arg_from_usage("[version] 'Version of the crate to package; may \
                                                include dependency operators'")
+                              .arg_from_usage("--path [path] 'If local package, path to the crate to package'")
                      ])
         .subcommands(vec![SubCommand::with_name("extract")
                               .about("Extract only a crate, without any other transformations.")
